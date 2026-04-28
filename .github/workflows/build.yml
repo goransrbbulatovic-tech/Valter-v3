@@ -1,0 +1,209 @@
+name: Build - Valter
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ created ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout kod
+        uses: actions/checkout@v4
+
+      - name: Instaliraj Qt 5.15
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '5.15.2'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          cache: true
+          cache-key-prefix: qt-cache
+
+      - name: Postavi MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ── Build Valter ──────────────────────────────────────────────────────
+      - name: Kompajluj Valter
+        shell: cmd
+        run: |
+          if not exist build-release mkdir build-release
+          cd build-release
+          qmake ..\EvidencijaKCBar.pro CONFIG+=release CONFIG-=debug
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          nmake
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+      # ── Build Keygen ──────────────────────────────────────────────────────
+      - name: Kompajluj Keygen
+        shell: cmd
+        run: |
+          if not exist build-keygen mkdir build-keygen
+          cd build-keygen
+          qmake ..\keygen\ValterKeygen.pro CONFIG+=release CONFIG-=debug
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          nmake
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+      - name: Prikazi output
+        shell: cmd
+        run: |
+          dir /s /b build-release\*.exe build-keygen\*.exe 2>nul || echo NEMA exe!
+
+      # ── Deploy Valter — windeployqt bez restrikcija, pa rucno dodaj sta fali
+      - name: Deploy Valter (windeployqt)
+        shell: cmd
+        run: |
+          if not exist deploy mkdir deploy
+          copy /Y "build-release\release\Valter.exe" "deploy\Valter.exe"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem windeployqt BEZ --no-* flagova da pokupe SVE sto treba
+          windeployqt --release --no-translations "deploy\Valter.exe"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem Nadji Qt bin folder
+          for /f "delims=" %%i in ('where qmake') do set QMAKE_PATH=%%i
+          for %%i in ("%QMAKE_PATH%") do set QT_BIN_DIR=%%~dpi
+
+          rem Eksplicitno dodaj DLL-ove koje windeployqt ponekad propusti
+          echo === Kopiram potrebne Qt DLL-ove ===
+          copy /Y "%QT_BIN_DIR%Qt5Core.dll"         "deploy\Qt5Core.dll"
+          copy /Y "%QT_BIN_DIR%Qt5Gui.dll"          "deploy\Qt5Gui.dll"
+          copy /Y "%QT_BIN_DIR%Qt5Widgets.dll"      "deploy\Qt5Widgets.dll"
+          copy /Y "%QT_BIN_DIR%Qt5PrintSupport.dll" "deploy\Qt5PrintSupport.dll"
+          copy /Y "%QT_BIN_DIR%Qt5Network.dll"      "deploy\Qt5Network.dll"
+
+          rem Eksplicitno dodaj Qt pluginove
+          if not exist deploy\platforms     mkdir deploy\platforms
+          if not exist deploy\printsupport  mkdir deploy\printsupport
+          if not exist deploy\imageformats  mkdir deploy\imageformats
+          if not exist deploy\styles        mkdir deploy\styles
+
+          copy /Y "%QT_BIN_DIR%..\plugins\platforms\qwindows.dll"                "deploy\platforms\qwindows.dll"
+          copy /Y "%QT_BIN_DIR%..\plugins\printsupport\windowsprintersupport.dll" "deploy\printsupport\windowsprintersupport.dll"
+          copy /Y "%QT_BIN_DIR%..\plugins\imageformats\qico.dll"                 "deploy\imageformats\qico.dll"  2>nul || echo ico plugin nije nadjen
+          copy /Y "%QT_BIN_DIR%..\plugins\styles\qwindowsvistastyle.dll"         "deploy\styles\qwindowsvistastyle.dll" 2>nul || echo style plugin nije nadjen
+
+          echo === Finalni sadrzaj deploy foldera ===
+          dir /s /b deploy\*.dll
+
+      # ── Deploy Keygen ─────────────────────────────────────────────────────
+      - name: Deploy Keygen (windeployqt)
+        shell: cmd
+        run: |
+          if not exist deploy-keygen mkdir deploy-keygen
+          copy /Y "build-keygen\release\ValterKeygen.exe" "deploy-keygen\ValterKeygen.exe"
+          windeployqt --release --no-translations "deploy-keygen\ValterKeygen.exe"
+          for /f "delims=" %%i in ('where qmake') do set QMAKE_PATH=%%i
+          for %%i in ("%QMAKE_PATH%") do set QT_BIN_DIR=%%~dpi
+          copy /Y "%QT_BIN_DIR%Qt5Network.dll" "deploy-keygen\Qt5Network.dll"
+
+      # ── Self-signed code signing ──────────────────────────────────────────
+      - name: Potpisi exe fajlove
+        shell: powershell
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -DnsName "KC Bar" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -Type CodeSigning -KeySpec Signature `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "KC Bar Code Signing" `
+            -NotAfter (Get-Date).AddYears(3)
+          $pwd = ConvertTo-SecureString -String "KCBar2025!" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath ".\kcbar_sign.pfx" -Password $pwd
+          $st = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" `
+            -Recurse -Filter "signtool.exe" | Select-Object -First 1 -ExpandProperty FullName
+          & $st sign /fd SHA256 /p "KCBar2025!" /f ".\kcbar_sign.pfx" `
+            /d "Valter - KC Bar" /du "https://github.com/${{ github.repository }}" `
+            "deploy\Valter.exe"
+          & $st sign /fd SHA256 /p "KCBar2025!" /f ".\kcbar_sign.pfx" `
+            /d "Valter Keygen - KC Bar" /du "https://github.com/${{ github.repository }}" `
+            "deploy-keygen\ValterKeygen.exe"
+
+      # ── Installer ─────────────────────────────────────────────────────────
+      - name: Instaliraj Inno Setup
+        shell: cmd
+        run: choco install innosetup --no-progress -y
+
+      - name: Napravi Installer
+        shell: cmd
+        run: |
+          rem Kopiraj cijeli deploy folder u release (installer.iss cita odatle)
+          if not exist release mkdir release
+          xcopy /E /I /Y deploy\* release\
+          copy /Y icon.ico release\icon.ico 2>nul || echo ok
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+      - name: Potpisi Installer
+        shell: powershell
+        run: |
+          $st = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" `
+            -Recurse -Filter "signtool.exe" | Select-Object -First 1 -ExpandProperty FullName
+          $ins = Get-ChildItem ".\installer_output\*.exe" | Select-Object -First 1
+          & $st sign /fd SHA256 /p "KCBar2025!" /f ".\kcbar_sign.pfx" `
+            /d "Valter Setup - KC Bar" /du "https://github.com/${{ github.repository }}" `
+            $ins.FullName
+
+      - name: Upload - Valter Portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Valter-Windows-Portable
+          path: deploy\
+          retention-days: 30
+
+      - name: Upload - Valter Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Valter-Installer
+          path: installer_output\*.exe
+          retention-days: 30
+
+      - name: Upload - Keygen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ValterKeygen
+          path: deploy-keygen\
+          retention-days: 30
+
+      - name: Priloži uz GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer_output/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Linux build (provjera kompajlacije) ─────────────────────────────────────
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instaliraj Qt5
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qtbase5-dev qtbase5-dev-tools libqt5gui5 libqt5widgets5 \
+            libqt5printsupport5 libqt5network5
+      - name: Kompajluj
+        run: |
+          mkdir build-linux && cd build-linux
+          qmake ../EvidencijaKCBar.pro CONFIG+=release
+          make -j$(nproc)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Valter-Linux
+          path: build-linux/Valter
+          retention-days: 14
